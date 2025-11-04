@@ -306,6 +306,18 @@ def clip(
 
   env = os.environ.copy()
 
+  # Patch messaging to work without real sockets (no ui_replay subprocess needed)
+  # Monkey-patch sub_sock before any imports try to use it
+  import msgq
+  original_sub_sock = msgq.sub_sock
+  def mock_sub_sock(endpoint, *args, **kwargs):
+    """Mock socket creation for replay mode - returns a dummy object."""
+    from unittest.mock import MagicMock
+    mock = MagicMock()
+    mock.receive = MagicMock(return_value=None)
+    return mock
+  msgq.sub_sock = mock_sub_sock
+
   # Import GUI components AFTER DISPLAY is set (GLFW reads DISPLAY at import time)
   from openpilot.system.ui.lib.application import gui_app
   from openpilot.selfdrive.ui.layouts.main import MainLayout
@@ -315,6 +327,21 @@ def clip(
     # Load frames and setup VisionIPC
     logger.info('loading camera frames...')
     fr = get_frame_reader(route, quality)
+    logger.info(f'Camera frames loaded: count={fr.frame_count}, dimensions={fr.w}x{fr.h}')
+
+    # Test reading a few frames
+    if fr.frame_count > 0:
+      try:
+        test_frame_0 = fr.get(0)
+        test_frame_mid = fr.get(min(100, fr.frame_count - 1))
+        logger.info(f'Frame 0: shape={test_frame_0.shape if hasattr(test_frame_0, "shape") else type(test_frame_0)}, size={len(test_frame_0.tobytes() if hasattr(test_frame_0, "tobytes") else test_frame_0)} bytes')
+        logger.info(f'Frame {min(100, fr.frame_count - 1)}: shape={test_frame_mid.shape if hasattr(test_frame_mid, "shape") else type(test_frame_mid)}, size={len(test_frame_mid.tobytes() if hasattr(test_frame_mid, "tobytes") else test_frame_mid)} bytes')
+      except Exception as e:
+        logger.warning(f'Failed to read test frames: {e}')
+
+    # Create shared memory directory for VisionIPC
+    shm_dir = Path(f'/dev/shm/{prefix}')
+    shm_dir.mkdir(parents=True, exist_ok=True)
 
     # Create VisionIpcServer for camera frames
     vipc_server = VisionIpcServer("camerad")
@@ -324,38 +351,53 @@ def clip(
     # Small delay to let VisionIPC server start
     time.sleep(0.1)
 
-    # Load and filter log messages to time range
+    # Load log messages
     logger.info('loading log messages...')
-    messages = []
-    route_start_timestamp = None
+    filtered_messages = []
+    start_mono_time = None
+    message_types = {}
+    road_encode_messages = []
 
-    # Get route start timestamp from first segment (for absolute time calculation)
-    route_start_lr = LogReader(f"{route.name.canonical_name}/0", default_mode=ReadMode.RLOG)
-    for msg in route_start_lr:
-      route_start_timestamp = msg.logMonoTime
-      break  # Just need the first message's timestamp
-
-    # Load all messages from the relevant segments
+    # Load all messages from the segments (LogReader already loaded correct segments)
     for msg in lr:
-      messages.append(msg)
+      if start_mono_time is None:
+        start_mono_time = msg.logMonoTime
+      filtered_messages.append(msg)
 
-    # Filter messages to time range (start to end in seconds relative to route start)
-    if route_start_timestamp is None:
-      # Fallback: use first message timestamp if we couldn't get route start
-      route_start_timestamp = messages[0].logMonoTime if messages else 0
+      # Count message types
+      msg_type = msg.which()
+      message_types[msg_type] = message_types.get(msg_type, 0) + 1
 
-    start_mono_time = route_start_timestamp + int(start * 1e9)
-    end_mono_time = route_start_timestamp + int(end * 1e9)
-    filtered_messages = [
-      msg for msg in messages
-      if start_mono_time <= msg.logMonoTime <= end_mono_time
-    ]
+      # Track roadEncodeIdx messages
+      if msg_type == 'roadEncodeIdx':
+        road_encode_messages.append((msg.logMonoTime, msg.roadEncodeIdx.frameId, msg.roadEncodeIdx.type))
 
+    logger.info(f'Loaded {len(filtered_messages)} messages')
+    logger.info(f'Message types: {dict(sorted(message_types.items(), key=lambda x: x[1], reverse=True)[:10])}')
+    logger.info(f'First message timestamp: {start_mono_time}')
+    logger.info(f'Last message timestamp: {filtered_messages[-1].logMonoTime if filtered_messages else "N/A"}')
+    logger.info(f'Duration: {(filtered_messages[-1].logMonoTime - start_mono_time) / 1e9:.1f}s' if filtered_messages else 'N/A')
+    logger.info(f'Found {len(road_encode_messages)} roadEncodeIdx messages')
+    if road_encode_messages:
+      logger.info(f'  First: timestamp={road_encode_messages[0][0]}, frameId={road_encode_messages[0][1]}, type={road_encode_messages[0][2]}')
+      logger.info(f'  Last: timestamp={road_encode_messages[-1][0]}, frameId={road_encode_messages[-1][1]}, type={road_encode_messages[-1][2]}')
     if not filtered_messages:
-      raise ValueError(f'No messages found in time range {start}s to {end}s (route start timestamp: {route_start_timestamp})')
+      raise ValueError('No messages found in log')
 
     # Services that ui_state.sm needs
     needed_services = set(ui_state.sm.services)
+
+    # Disable frequency tracking for replay mode (we're not real-time)
+    ui_state.sm.simulation = True
+    # Patch FrequencyTracker.valid to avoid ZeroDivisionError in replay mode
+    from cereal.messaging import FrequencyTracker
+    original_valid = FrequencyTracker.valid.fget
+    def patched_valid(self):
+      try:
+        return original_valid(self)
+      except ZeroDivisionError:
+        return True  # Always valid in replay mode
+    FrequencyTracker.valid = property(patched_valid)
 
     # Initialize Python UI in headless mode
     logger.debug('initializing UI...')
@@ -388,90 +430,179 @@ def clip(
     ffmpeg_proc = Popen(ffmpeg_cmd, stdin=PIPE, env=env)
 
     try:
-      frame_count = 0
-      target_frames = int(duration * FRAMERATE)
-      frame_time = 1.0 / FRAMERATE
-      frame_time_ns = int(1e9 / FRAMERATE)
-      start_time = time.monotonic()
-      current_frame_time = start_mono_time
+      # Find first roadEncodeIdx message to align frame timing
+      # Use timestampSof (camera frame timestamp) not logMonoTime for proper synchronization
+      first_camera_frame_ts = None
+      first_frame_id = None
+      for msg in filtered_messages:
+        if msg.which() == 'roadEncodeIdx' and msg.roadEncodeIdx.type == 1:  # fullHEVC
+          first_camera_frame_ts = msg.roadEncodeIdx.timestampSof  # Use camera frame timestamp, not logMonoTime
+          first_frame_id = msg.roadEncodeIdx.frameId
+          logger.info(f'First camera frame: timestampSof={first_camera_frame_ts}, logMonoTime={msg.logMonoTime}, frameId={first_frame_id}')
+          logger.info(f'  Offset: logMonoTime - timestampSof = {(msg.logMonoTime - msg.roadEncodeIdx.timestampSof) / 1e6:.1f}ms')
+          break
+
+      if first_camera_frame_ts is None:
+        raise ValueError('No roadEncodeIdx messages found in log')
+
+      logger.info(f'Start mono time: {start_mono_time}, offset: {(first_camera_frame_ts - start_mono_time) / 1e9:.1f}s')
+
+      # Feed messages from first camera frame onwards to initialize ui_state properly
+      # Match messages using camera frame timestampSof for proper synchronization
+      all_needed_messages = [
+        msg for msg in filtered_messages
+        if msg.which() in needed_services and msg.logMonoTime >= first_camera_frame_ts
+      ]
+      if all_needed_messages:
+        # Feed in batches to avoid overwhelming
+        batch_size = 1000
+        for i in range(0, len(all_needed_messages), batch_size):
+          batch = all_needed_messages[i:i+batch_size]
+          ui_state.sm.update_msgs(time.monotonic(), batch)
+        # Update state after feeding all messages
+        ui_state._update_state()
+        ui_state._update_status()
+        logger.info(f'Initialized ui_state with {len(all_needed_messages)} messages from first camera frame onwards')
+
+      # Skip messages until we reach the first camera frame timestamp
+      # This ensures UI state and camera frames are synchronized during rendering
       msg_idx = 0
-      last_seen_frame_id = 0
+      skipped_count = 0
+      while msg_idx < len(filtered_messages) and filtered_messages[msg_idx].logMonoTime < first_camera_frame_ts:
+        msg_idx += 1
+        skipped_count += 1
+      logger.info(f'Skipped {skipped_count} messages before first camera frame')
 
-      # Render loop
-      while frame_count < target_frames and msg_idx < len(filtered_messages):
-        # Collect all messages for this frame time window
-        frame_end_time = current_frame_time + frame_time_ns
+      # Iterate over camera frames from log (roadEncodeIdx messages)
+      # This follows the pattern: for frame in log: ui.update_state(frame); ui.render(); capture_frame()
+      camera_frames = [(msg.logMonoTime, msg.roadEncodeIdx.frameId, msg.roadEncodeIdx.timestampSof, msg.roadEncodeIdx.timestampEof)
+                       for msg in filtered_messages
+                       if msg.which() == 'roadEncodeIdx' and msg.roadEncodeIdx.type == 1]
+
+      # Limit to duration
+      end_time = first_camera_frame_ts + int(duration * 1e9)
+      camera_frames = [(ts, fid, sof, eof) for ts, fid, sof, eof in camera_frames
+                       if sof >= first_camera_frame_ts and sof <= end_time]
+
+      logger.info(f'Found {len(camera_frames)} camera frames to render (duration: {duration}s)')
+
+      # Count total messages in needed_services
+      total_needed_messages = sum(1 for msg in filtered_messages if msg.which() in needed_services)
+      logger.info(f'Total messages in needed_services: {total_needed_messages}')
+      logger.info(f'Total camera frames: {len(camera_frames)}')
+      logger.info(f'Expected: 1 camera frame per frame, multiple messages per frame')
+
+      frame_count = 0
+      msg_idx = 0  # Track position in filtered_messages for finding matching messages
+
+      # Statistics tracking
+      total_messages_processed = 0
+      messages_by_frame = []
+      message_counts_by_type = {}
+
+      # Render loop: iterate over actual camera frames from log
+      # Match original pattern: for frame in log: ui.update_state(frame); ui.render(); capture_frame()
+      for frame_log_ts, frame_id, frame_timestamp_sof, frame_timestamp_eof in camera_frames:
+        if frame_count >= int(duration * FRAMERATE):
+          break  # Stop at target frame count
+
+        # Feed messages that have arrived up to this camera frame's timestamp
+        # Process messages chronologically, matching original replay behavior
         frame_messages = []
-        current_frame_id = last_seen_frame_id  # Start with last seen frame
-
         while msg_idx < len(filtered_messages):
           msg = filtered_messages[msg_idx]
-          if msg.logMonoTime > frame_end_time:
+          # Stop when we reach messages after this camera frame
+          if msg.logMonoTime > frame_timestamp_sof + 100e6:  # 100ms after camera frame (allow some latency)
             break
-
-          # Collect messages for SubMaster
           if msg.which() in needed_services:
             frame_messages.append(msg)
-
-          # Track roadEncodeIdx to get current frame
-          if msg.which() == 'roadEncodeIdx':
-            eidx = msg.roadEncodeIdx
-            # Type.fullHEVC = 1 (from cereal/log.capnp)
-            if eidx.type == 1:  # fullHEVC
-              current_frame_id = eidx.frameId
-              last_seen_frame_id = current_frame_id
-
+            # Track message type counts
+            msg_type = msg.which()
+            message_counts_by_type[msg_type] = message_counts_by_type.get(msg_type, 0) + 1
           msg_idx += 1
 
-        # Feed messages to SubMaster
+        total_messages_processed += len(frame_messages)
+        messages_by_frame.append((frame_count, len(frame_messages), frame_id, frame_timestamp_sof))
+
+        # 1. Update UI state (equivalent to ui_state.update() in original)
+        #    Original: ui_state.update() -> sm.update(0) reads from ZMQ
+        #    Ours: Feed messages manually then update state
         if frame_messages:
           ui_state.sm.update_msgs(time.monotonic(), frame_messages)
+          # Debug output every 60 frames
+          if frame_count % 60 == 0:
+            msg_types = [msg.which() for msg in frame_messages]
+            logger.info(f'Frame {frame_count}: Processed {len(frame_messages)} messages: {set(msg_types)}')
+        elif frame_count % 60 == 0:
+          logger.warning(f'Frame {frame_count}: No messages matched to camera frame (frame_id={frame_id}, timestampSof={frame_timestamp_sof})')
 
-        # Update UI state (manually call update methods since we're not using ZMQ)
         ui_state._update_state()
         ui_state._update_status()
         if time.monotonic() - ui_state._param_update_time > 5.0:
           ui_state.update_params()
         device.update()
 
-        # Get camera frame and send to VisionIPC
-        if current_frame_id >= 0 and fr.frame_count > 0:
+        # 2. Send camera frame to VisionIPC (original: replay subprocess handles this)
+        if fr.frame_count > 0:
           try:
-            frame_idx = min(current_frame_id, fr.frame_count - 1)
-            if 0 <= frame_idx < fr.frame_count:
-              frame_data = fr.get(frame_idx)
-              # Convert numpy array to bytes
-              frame_bytes = frame_data.tobytes() if isinstance(frame_data, np.ndarray) else frame_data
-              # Send frame to VisionIPC
-              vipc_server.send(VisionStreamType.VISION_STREAM_ROAD, frame_bytes,
-                             frame_id=current_frame_id,
-                             timestamp_sof=current_frame_time,
-                             timestamp_eof=current_frame_time)
-          except (KeyError, IndexError, ValueError) as e:
-            logger.warning(f'Failed to get frame {current_frame_id}: {e}')
+            # Convert absolute frame ID to relative index for FrameReader
+            frame_idx = frame_id - first_frame_id
+            frame_idx = max(0, min(frame_idx, fr.frame_count - 1))  # Clamp to valid range
 
-        # Render frame to texture
+            frame_data = fr.get(frame_idx)
+            # Convert numpy array to bytes
+            frame_bytes = frame_data.tobytes() if isinstance(frame_data, np.ndarray) else frame_data
+
+            # Debug output every 60 frames (3 seconds)
+            if frame_count % 60 == 0:
+              logger.info(f'Frame {frame_count}: frame_id={frame_id}, frame_idx={frame_idx}, frame_size={len(frame_bytes)} bytes')
+
+            # Send frame to VisionIPC
+            vipc_server.send(VisionStreamType.VISION_STREAM_ROAD, frame_bytes,
+                           frame_id=frame_id,
+                           timestamp_sof=frame_timestamp_sof,  # Use camera frame timestampSof
+                           timestamp_eof=frame_timestamp_eof)  # Use camera frame timestampEof
+          except (KeyError, IndexError, ValueError) as e:
+            logger.warning(f'Failed to get frame {frame_id} (idx {frame_idx}): {e}')
+
+        # 3. Render frame to texture (matches original exactly)
         rl.begin_texture_mode(gui_app._render_texture)
         rl.clear_background(rl.BLACK)
         main_layout.render()
         rl.end_texture_mode()
 
-        # Extract frame pixels
+        # 4. Extract frame pixels (matches original exactly)
         frame_data = extract_frame_from_texture(gui_app._render_texture, width, height)
 
-        # Write to ffmpeg
+        # 5. Write to ffmpeg (matches original exactly, no rate limiting)
         assert ffmpeg_proc.stdin is not None
         ffmpeg_proc.stdin.write(frame_data)
         ffmpeg_proc.stdin.flush()
 
         frame_count += 1
-        current_frame_time += frame_time_ns
 
-        # Rate limiting to match FRAMERATE
-        next_frame_time = (frame_count + 1) * frame_time
-        sleep_time = next_frame_time - (time.monotonic() - start_time)
-        if sleep_time > 0:
-          time.sleep(sleep_time)
+      # Print comprehensive statistics
+      logger.info('=' * 80)
+      logger.info('MESSAGE PROCESSING STATISTICS:')
+      logger.info(f'Total camera frames processed: {frame_count}')
+      logger.info(f'Total messages processed: {total_messages_processed}')
+      logger.info(f'Average messages per frame: {total_messages_processed / frame_count if frame_count > 0 else 0:.2f}')
+      logger.info('')
+      logger.info('Message counts by type:')
+      for msg_type, count in sorted(message_counts_by_type.items(), key=lambda x: x[1], reverse=True):
+        logger.info(f'  {msg_type}: {count}')
+      logger.info('')
+      logger.info('Messages per frame (first 10 and last 10):')
+      for frame_num, msg_count, fid, ts in messages_by_frame[:10]:
+        logger.info(f'  Frame {frame_num}: {msg_count} messages, frame_id={fid}, timestampSof={ts}')
+      if len(messages_by_frame) > 20:
+        logger.info('  ...')
+        for frame_num, msg_count, fid, ts in messages_by_frame[-10:]:
+          logger.info(f'  Frame {frame_num}: {msg_count} messages, frame_id={fid}, timestampSof={ts}')
+      logger.info('')
+      logger.info(f'Frames with 0 messages: {sum(1 for _, count, _, _ in messages_by_frame if count == 0)}')
+      logger.info(f'Frames with messages: {sum(1 for _, count, _, _ in messages_by_frame if count > 0)}')
+      logger.info('=' * 80)
 
       # Cleanup
       assert ffmpeg_proc.stdin is not None
