@@ -91,6 +91,9 @@ class URLFile:
     return self._length
 
   def read(self, ll: int | None = None) -> bytes:
+    # Convert numpy int to Python int to avoid overflow issues in slice calculations
+    if ll is not None:
+      ll = int(ll)
     if self._force_download:
       return self.read_aux(ll=ll)
 
@@ -102,7 +105,7 @@ class URLFile:
     response = b""
     while True:
       self._pos = position
-      chunk_number = self._pos / CHUNK_SIZE
+      chunk_number = self._pos // CHUNK_SIZE  # Use integer division for consistent file names
       file_name = hash_256(self._url) + "_" + str(chunk_number)
       full_path = os.path.join(Paths.download_cache_root(), str(file_name))
       data = None
@@ -164,7 +167,8 @@ class URLFile:
     return parts
 
   def seek(self, pos: int) -> None:
-    self._pos = pos
+    # Convert numpy int to Python int to avoid overflow issues
+    self._pos = int(pos)
 
   @property
   def name(self) -> str:
