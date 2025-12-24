@@ -12,7 +12,7 @@ import numpy as np
 import tqdm
 from argparse import ArgumentParser
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 from openpilot.tools.lib.route import Route
 from openpilot.tools.lib.logreader import LogReader
@@ -210,29 +210,33 @@ class FrameQueue:
 
 
 def _decode_gop_worker(args):
-  """Worker function to decode a single GOP. Runs in a separate process."""
-  gop_idx, video_data, prefix, gop_start, gop_end, frame_start, frame_end, w, h, pix_fmt = args
+  """Worker function to decode a single GOP."""
+  gop_idx, path, prefix, gop_start, gop_end, gop_global_start, emit_start, emit_end, w, h, pix_fmt = args
   from openpilot.tools.lib.framereader import decompress_video_data
-  raw = prefix + video_data[gop_start:gop_end]
+  with FileReader(path) as f:
+    f.seek(gop_start)
+    raw = prefix + f.read(gop_end - gop_start)
   frames = decompress_video_data(raw, w, h, pix_fmt)
-  # Return only frames within our range
   result = []
   for i, frame in enumerate(frames):
-    global_frame_idx = frame_start + i
-    if global_frame_idx >= frame_end:
+    global_frame_idx = gop_global_start + i
+    if global_frame_idx >= emit_end:
       break
+    if global_frame_idx < emit_start:
+      continue
     result.append((global_frame_idx, frame.tobytes()))
   return gop_idx, result
 
 
 class ParallelFrameQueue:
-  """Frame queue that decodes multiple GOPs in parallel for faster throughput."""
+  """Frame queue that decodes multiple GOPs in parallel while streaming."""
 
-  def __init__(self, camera_paths, start_time, end_time, fps=20, num_workers=None, use_qcam=False):
+  def __init__(self, camera_paths, start_time, end_time, fps=20, num_workers=None, use_qcam=False, prefetch_count=60):
     from openpilot.tools.lib.framereader import get_video_index, HEVC_SLICE_I
 
     self.num_workers = num_workers or min(8, (multiprocessing.cpu_count() or 4))
     self.pix_fmt = "nv12"
+    self._queue, self._stop, self._error = queue.Queue(maxsize=prefetch_count), threading.Event(), None
 
     # Get first valid path and dimensions
     seg_start = int(start_time) // 60
@@ -249,104 +253,134 @@ class ParallelFrameQueue:
     start_frame = int(start_time * fps)
     end_frame = int(end_time * fps)
 
-    # Download and index all needed segments, collect GOP info
-    self._gops = []  # List of (video_data, prefix, gop_start_byte, gop_end_byte, frame_start, frame_end)
-    self._video_data = {}  # seg_idx -> video bytes
-    self._prefixes = {}    # seg_idx -> prefix bytes
-    self._indices = {}     # seg_idx -> index array
+    # Build list of GOPs to decode (streaming)
+    self._gops = []  # List of (gop_idx, path, prefix, gop_start_byte, gop_end_byte, gop_global_start, emit_start, emit_end, w, h, pix_fmt)
+    seg_start_idx = start_frame // frames_per_seg
+    seg_end_idx = (end_frame - 1) // frames_per_seg
 
-    logger.info(f"Pre-downloading and indexing {(end_frame - start_frame) // frames_per_seg + 1} camera segment(s)...")
+    logger.info(f"Indexing {seg_end_idx - seg_start_idx + 1} camera segment(s) for parallel decode...")
 
-    for global_frame in range(start_frame, end_frame):
-      seg_idx = global_frame // frames_per_seg
-      if seg_idx not in self._video_data:
-        path = camera_paths[seg_idx] if seg_idx < len(camera_paths) else None
-        if not path:
-          raise RuntimeError(f"No camera file for segment {seg_idx}")
-        # Download entire segment
-        with FileReader(path) as f:
-          self._video_data[seg_idx] = f.read()
-        # Build index
-        index_data = get_video_index(path)
-        self._indices[seg_idx] = index_data["index"]
-        self._prefixes[seg_idx] = index_data["global_prefix"]
-
-    # Build list of GOPs to decode
-    logger.info(f"Building GOP list for parallel decoding with {self.num_workers} workers...")
-    processed_gops = set()
-
-    for global_frame in range(start_frame, end_frame):
-      seg_idx = global_frame // frames_per_seg
-      local_frame = global_frame % frames_per_seg
-      index = self._indices[seg_idx]
-
-      # Find GOP containing this frame
+    gop_idx = 0
+    for seg_idx in range(seg_start_idx, seg_end_idx + 1):
+      path = camera_paths[seg_idx] if seg_idx < len(camera_paths) else None
+      if not path:
+        raise RuntimeError(f"No camera file for segment {seg_idx}")
+      index_data = get_video_index(path)
+      index = index_data["index"]
+      prefix = index_data["global_prefix"]
+      frame_count = len(index) - 1  # sentinel row at the end
       iframes = np.where(index[:, 0] == HEVC_SLICE_I)[0]
-      gop_start_frame = iframes[np.searchsorted(iframes, local_frame, side="right") - 1]
+      if len(iframes) == 0:
+        raise RuntimeError(f"No I-frames found in segment {seg_idx}")
 
-      # Find end of this GOP
-      gop_end_frame = len(index) - 1  # sentinel
-      for i in range(gop_start_frame + 1, len(index)):
-        if index[i, 0] == HEVC_SLICE_I:
-          gop_end_frame = i
+      local_start = start_frame - seg_idx * frames_per_seg if seg_idx == seg_start_idx else 0
+      local_end = end_frame - seg_idx * frames_per_seg if seg_idx == seg_end_idx else frame_count
+      local_start = max(0, local_start)
+      local_end = min(frame_count, local_end)
+      if local_start >= local_end:
+        continue
+
+      start_i = np.searchsorted(iframes, local_start, side="right") - 1
+      if start_i < 0:
+        start_i = 0
+
+      for i in range(start_i, len(iframes)):
+        gop_start_frame = int(iframes[i])
+        gop_end_frame = frame_count if i + 1 >= len(iframes) else int(iframes[i + 1])
+        if gop_end_frame <= local_start:
+          continue
+        if gop_start_frame >= local_end:
           break
 
-      gop_key = (seg_idx, gop_start_frame)
-      if gop_key not in processed_gops:
-        processed_gops.add(gop_key)
         gop_start_byte = int(index[gop_start_frame, 1])
         gop_end_byte = int(index[gop_end_frame, 1])
-
-        # Calculate global frame range for this GOP
         gop_global_start = seg_idx * frames_per_seg + gop_start_frame
         gop_global_end = seg_idx * frames_per_seg + gop_end_frame
+        emit_start = max(gop_global_start, start_frame)
+        emit_end = min(gop_global_end, end_frame)
 
         self._gops.append((
-          len(self._gops),  # gop_idx for ordering
-          self._video_data[seg_idx],
-          self._prefixes[seg_idx],
+          gop_idx,
+          path,
+          prefix,
           gop_start_byte,
           gop_end_byte,
           gop_global_start,
-          gop_global_end,
+          emit_start,
+          emit_end,
           self.frame_w,
           self.frame_h,
-          self.pix_fmt
+          self.pix_fmt,
         ))
+        gop_idx += 1
 
-    logger.info(f"Decoding {len(self._gops)} GOPs in parallel...")
+    if not self._gops:
+      raise RuntimeError("No GOPs found for requested clip range")
 
-    # Decode all GOPs in parallel
-    self._decoded_frames = {}  # global_frame_idx -> frame_bytes
-    with multiprocessing.Pool(self.num_workers) as pool:
-      for gop_idx, frames in pool.imap_unordered(_decode_gop_worker, self._gops):
-        for frame_idx, frame_bytes in frames:
-          if start_frame <= frame_idx < end_frame:
-            self._decoded_frames[frame_idx] = frame_bytes
+    logger.info(f"Decoding {len(self._gops)} GOPs in parallel (streaming)...")
 
-    # Set up iterator
-    self._frame_iter = iter(range(start_frame, end_frame))
-    self._start_frame = start_frame
-    self._end_frame = end_frame
-    self._error = None
+    self._thread = threading.Thread(target=self._worker, daemon=True)
+    self._thread.start()
 
-    logger.info(f"Pre-decoded {len(self._decoded_frames)} frames")
+  def _worker(self):
+    try:
+      max_inflight = max(1, min(len(self._gops), self.num_workers * 2))
+      pending = {}
+      inflight = {}
+      next_submit = 0
+      next_emit = 0
+
+      def submit_next(pool):
+        nonlocal next_submit
+        if next_submit >= len(self._gops) or self._stop.is_set():
+          return
+        fut = pool.submit(_decode_gop_worker, self._gops[next_submit])
+        inflight[fut] = next_submit
+        next_submit += 1
+
+      with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+        for _ in range(max_inflight):
+          submit_next(pool)
+
+        while next_emit < len(self._gops) and not self._stop.is_set():
+          if not inflight:
+            raise RuntimeError("Parallel decoder stalled with no in-flight tasks")
+          done, _ = wait(inflight, timeout=0.1, return_when=FIRST_COMPLETED)
+          for fut in done:
+            gop_idx, frames = fut.result()
+            pending[gop_idx] = frames
+            inflight.pop(fut, None)
+            submit_next(pool)
+
+          while next_emit in pending and not self._stop.is_set():
+            frames = pending.pop(next_emit)
+            for item in frames:
+              if self._stop.is_set():
+                break
+              self._queue.put(item)
+            next_emit += 1
+    except Exception as e:
+      logger.exception("Decode error")
+      self._error = e
+    finally:
+      self._queue.put(None)
 
   def get(self, timeout=60.0):
     if self._error:
       raise self._error
-    try:
-      frame_idx = next(self._frame_iter)
-      if frame_idx not in self._decoded_frames:
-        raise RuntimeError(f"Frame {frame_idx} not decoded")
-      return frame_idx, self._decoded_frames[frame_idx]
-    except StopIteration:
+    result = self._queue.get(timeout=timeout)
+    if result is None:
       raise StopIteration("No more frames")
+    return result
 
   def stop(self):
-    # Clean up decoded frames to free memory
-    self._decoded_frames.clear()
-    self._video_data.clear()
+    self._stop.set()
+    while not self._queue.empty():
+      try:
+        self._queue.get_nowait()
+      except queue.Empty:
+        break
+    self._thread.join(timeout=2.0)
 
 
 def load_route_metadata(route):
